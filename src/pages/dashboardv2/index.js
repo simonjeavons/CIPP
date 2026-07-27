@@ -28,6 +28,7 @@ import { LicenseCard } from '../../components/CippComponents/LicenseCard'
 import { TenantInfoCard } from '../../components/CippComponents/TenantInfoCard'
 import { TenantMetricsGrid } from '../../components/CippComponents/TenantMetricsGrid'
 import { AssessmentCard } from '../../components/CippComponents/AssessmentCard'
+import { AlertsOverviewCard } from '../../components/CippComponents/AlertsOverviewCard'
 import { CippReportToolbar } from '../../components/CippComponents/CippReportToolbar'
 import { Assessment as AssessmentIcon } from '@mui/icons-material'
 import ChevronDownIcon from '@heroicons/react/24/outline/ChevronDownIcon'
@@ -168,7 +169,12 @@ const Page = () => {
       const menuItems = filteredPortals.map((portal) => ({
         label: portal.label,
         target: '_blank',
-        link: portal.url.replace(portal.variable, tenantLookup?.[portal.variable]),
+        // A portal with a `field` has a URL the backend resolved for us (SharePoint's host cannot be
+        // derived from the tenant). Use it when it's there, otherwise fall back to the templated URL.
+        link:
+          portal.field && tenantLookup?.[portal.field]
+            ? tenantLookup[portal.field]
+            : portal.url.replace(portal.variable, tenantLookup?.[portal.variable]),
         icon: portal.icon,
       }))
       setPortalMenuItems(menuItems)
@@ -345,6 +351,11 @@ const Page = () => {
             />
           </Grid>
         </Grid>
+
+        {/* Alerts Section - Full Width */}
+        <Box sx={{ mb: 2 }} data-tutorial="dashboard-alerts">
+          <AlertsOverviewCard tenantFilter={currentTenant} />
+        </Box>
 
         {/* Identity Section - 2 Column Grid */}
         <Box>
