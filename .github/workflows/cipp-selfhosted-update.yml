@@ -1,0 +1,523 @@
+name: CIPP self-hosted update
+
+# Fork-only automation. Keeps this instance's frontend and API on the newest
+# MATCHED upstream version pair, unattended. Upstream has no file at this path,
+# so it carries no merge-conflict risk on a fork sync.
+#
+# Manual equivalent, and the reasoning behind every guard here:
+# DEPLOY-SHARED-CIPP.md -> "Keeping it updated".
+#
+# Why the frontend is built inline rather than by dispatching the Azure-generated
+# SWA workflow: GitHub will not trigger a workflow from an event created by the
+# built-in GITHUB_TOKEN, so delegating would require a stored PAT.
+
+on:
+  schedule:
+    # Every 6h. Scheduled runs pass no inputs, so they are real runs, not dry runs.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Resolve, merge and run guards, but publish nothing"
+        type: boolean
+        default: true
+      target_version:
+        description: "Pin to this version instead of the latest API release (e.g. 10.9.0)"
+        type: string
+        default: ""
+      force:
+        description: "Deploy even if already on the target version"
+        type: boolean
+        default: false
+
+concurrency:
+  group: cipp-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the merge commit
+  id-token: write # federated OIDC login to Azure
+
+env:
+  RG: rg-cipp-prod
+  FUNCTION_APP: cippdi3n7
+  SWA_HOSTNAME: icy-coast-0a0b54603.7.azurestaticapps.net
+  # Login stays locked to the Shoothill tenant. Losing this locks the team out,
+  # so it is guarded on the merged tree before anything is published.
+  LOGIN_TENANT_ID: 2ed7e928-9b2d-4426-9a02-a3f267fb5b10
+  LOGIN_CLIENT_ID: 69f3dba4-7bc5-4117-b252-ad403b43d822
+  UPSTREAM_FRONTEND: https://github.com/KelvinTegelaar/CIPP.git
+  UPSTREAM_API_REPO: KelvinTegelaar/CIPP-API
+  API_ZIP_URL: https://cippreleases.blob.core.windows.net/cipp-api/latest.zip
+  SWA_WORKFLOW: .github/workflows/azure-static-web-apps-icy-coast-0a0b54603.yml
+  SELF_WORKFLOW: .github/workflows/cipp-selfhosted-update.yml
+  EXPECTED_FUNCTIONS: "CIPPActivityFunction CIPPHttpTrigger CIPPOrchestrator CIPPQueueTrigger CIPPTimer"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Read run mode
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "DRY_RUN=1" >> "$GITHUB_ENV"
+          else
+            echo "DRY_RUN=0" >> "$GITHUB_ENV"
+          fi
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "FORCE=1" >> "$GITHUB_ENV"
+          else
+            echo "FORCE=0" >> "$GITHUB_ENV"
+          fi
+          # Nothing has been published yet, so nothing needs undoing yet.
+          echo "FAILED=0" >> "$GITHUB_ENV"
+          echo "API_DEPLOYED=0" >> "$GITHUB_ENV"
+          echo "FRONTEND_PUSHED=0" >> "$GITHUB_ENV"
+          echo "SKIP=0" >> "$GITHUB_ENV"
+
+      - name: Log in to Azure (federated OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Fetch Kudu credentials
+        run: |
+          set -euo pipefail
+          # Fetched per run via ARM and masked. Never stored in the repo.
+          CREDS=$(az functionapp deployment list-publishing-credentials \
+            -g "$RG" -n "$FUNCTION_APP" \
+            --query "[publishingUserName,publishingPassword]" -o tsv)
+          KUDU_USER=$(echo "$CREDS" | head -1)
+          KUDU_PASS=$(echo "$CREDS" | tail -1)
+          echo "::add-mask::$KUDU_PASS"
+          echo "KUDU_USER=$KUDU_USER" >> "$GITHUB_ENV"
+          echo "KUDU_PASS=$KUDU_PASS" >> "$GITHUB_ENV"
+
+      - name: Resolve target version and current state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_IN: ${{ inputs.target_version }}
+        run: |
+          set -euo pipefail
+
+          # --- target version V -------------------------------------------------
+          if [ -n "$TARGET_IN" ]; then
+            V="${TARGET_IN#v}"
+            PUBLISHED=""
+            echo "Target pinned by input: $V"
+          else
+            REL=$(gh api "repos/$UPSTREAM_API_REPO/releases/latest")
+            V=$(echo "$REL" | jq -r .tag_name | sed 's/^v//')
+            PUBLISHED=$(echo "$REL" | jq -r .published_at)
+            echo "Latest API release: $V (published $PUBLISHED)"
+          fi
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Resolved target version '$V' is not a semver triple"
+            exit 1
+          fi
+
+          # --- what is live right now -------------------------------------------
+          API_NOW=$(curl -fsS --retry 3 --retry-delay 5 -u "$KUDU_USER:$KUDU_PASS" \
+            "https://$FUNCTION_APP.scm.azurewebsites.net/api/vfs/site/wwwroot/version_latest.txt" \
+            | tr -d '\r\n ')
+          FE_NOW=$(jq -r .version package.json)
+          echo "Deployed API: $API_NOW | fork frontend: $FE_NOW | target: $V"
+
+          # A "latest" release older than what is deployed means something upstream
+          # was yanked or re-tagged. Do not quietly downgrade the portal.
+          if [ -z "$TARGET_IN" ] && [ "$V" != "$API_NOW" ]; then
+            OLDEST=$(printf '%s\n%s\n' "$V" "$API_NOW" | sort -V | head -1)
+            if [ "$OLDEST" = "$V" ]; then
+              echo "::warning::Latest upstream release $V is older than deployed $API_NOW - refusing to downgrade. Use target_version to override."
+              echo "SKIP=1" >> "$GITHUB_ENV"
+              echo "SKIP_REASON=refused downgrade $API_NOW -> $V" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          fi
+
+          NEED_API=0
+          NEED_FE=0
+          [ "$API_NOW" != "$V" ] && NEED_API=1
+          [ "$FE_NOW" != "$V" ] && NEED_FE=1
+          if [ "$FORCE" = "1" ]; then
+            NEED_API=1
+            NEED_FE=1
+          fi
+
+          {
+            echo "TARGET_VERSION=$V"
+            echo "API_VERSION_BEFORE=$API_NOW"
+            echo "FE_VERSION_BEFORE=$FE_NOW"
+            echo "NEED_API=$NEED_API"
+            echo "NEED_FE=$NEED_FE"
+          } >> "$GITHUB_ENV"
+
+          if [ "$NEED_API" = "0" ] && [ "$NEED_FE" = "0" ]; then
+            echo "Already on $V - nothing to do."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            echo "SKIP_REASON=already on $V" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # --- frontend commit that carries version V ---------------------------
+          if [ "$NEED_FE" = "1" ]; then
+            git remote add upstream "$UPSTREAM_FRONTEND" 2>/dev/null || true
+            git fetch --no-tags upstream +refs/heads/main:refs/remotes/upstream/main
+
+            SHA=""
+            # Prefer the tip of upstream main when it already carries V: that picks up
+            # fixes landed at this version that did not themselves touch package.json.
+            TIP=$(git rev-parse refs/remotes/upstream/main)
+            if [ "$(git show "$TIP:package.json" | jq -r .version)" = "$V" ]; then
+              SHA="$TIP"
+            else
+              # Otherwise walk back to the newest package.json commit that reads V.
+              for c in $(git log --format=%H -n 200 refs/remotes/upstream/main -- package.json); do
+                if [ "$(git show "$c:package.json" | jq -r .version)" = "$V" ]; then
+                  SHA="$c"
+                  break
+                fi
+              done
+            fi
+
+            if [ -z "$SHA" ]; then
+              # Upstream tags the frontend on minors only, so a fresh API patch
+              # normally waits hours for the matching version bump to land on main.
+              if [ -n "$PUBLISHED" ]; then
+                AGE=$(( ( $(date -u +%s) - $(date -u -d "$PUBLISHED" +%s) ) / 3600 ))
+                if [ "$AGE" -gt 72 ]; then
+                  echo "::error::API $V was released ${AGE}h ago but no upstream/main commit carries that frontend version. The version-bump convention this gate relies on may have changed."
+                  exit 1
+                fi
+                echo "No matching frontend commit yet (API $V is ${AGE}h old) - waiting."
+              else
+                echo "::error::No upstream/main commit carries frontend version $V"
+                exit 1
+              fi
+              echo "SKIP=1" >> "$GITHUB_ENV"
+              echo "SKIP_REASON=no frontend commit for $V yet" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Frontend target commit: $SHA"
+            echo "FRONTEND_SHA=$SHA" >> "$GITHUB_ENV"
+          fi
+
+      - name: Merge the pinned upstream commit
+        if: env.SKIP != '1' && env.NEED_FE == '1'
+        run: |
+          set -euo pipefail
+          git config user.name "cipp-update-bot"
+          git config user.email "cipp-update-bot@users.noreply.github.com"
+          # Merge an exact commit, never a branch, so what gets deployed is pinned.
+          if git merge --no-ff --no-edit "$FRONTEND_SHA" \
+               -m "Auto-update: merge upstream CIPP $TARGET_VERSION ($FRONTEND_SHA)"; then
+            echo "MERGE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          else
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            git merge --abort || true
+            echo "::error::Merge conflict against fork customisations: $CONFLICTS - resolve by hand. Nothing was published."
+            exit 1
+          fi
+          echo "Merged frontend version: $(jq -r .version package.json)"
+
+      - name: Guard fork customisations on the merged tree
+        if: env.SKIP != '1' && env.NEED_FE == '1'
+        run: |
+          set -uo pipefail
+          fail=0
+          check() {
+            if ! eval "$2"; then
+              echo "::error::guard failed: $1"
+              fail=1
+            fi
+          }
+
+          # The one that locks the team out if it regresses.
+          check "staticwebapp.config.json keeps the tenant-locked openIdIssuer" \
+            "grep -q \"openIdIssuer.*$LOGIN_TENANT_ID\" staticwebapp.config.json"
+          check "staticwebapp.config.json keeps the AAD_CLIENT_ID setting name" \
+            "grep -q AAD_CLIENT_ID staticwebapp.config.json"
+          check "staticwebapp.config.json keeps the AAD_CLIENT_SECRET setting name" \
+            "grep -q AAD_CLIENT_SECRET staticwebapp.config.json"
+          # Branding: upstream owns CippSponsor.jsx, so this is the file that drifts.
+          check "CippSponsor.jsx still renders the Shoothill logo" \
+            "grep -q shoothill-logo- src/components/CippComponents/CippSponsor.jsx"
+          check "light logo asset present" "test -s public/assets/shoothill-logo-light.svg"
+          check "dark logo asset present" "test -s public/assets/shoothill-logo-dark.svg"
+          # Self-preservation: a merge must not delete either deploy path.
+          check "SWA deploy workflow present" "test -s \"$SWA_WORKFLOW\""
+          check "this workflow present" "test -s \"$SELF_WORKFLOW\""
+          # Sanity: the merged tree must be the version we think we are deploying.
+          check "merged package.json version is $TARGET_VERSION" \
+            "[ \"\$(jq -r .version package.json)\" = \"$TARGET_VERSION\" ]"
+
+          [ "$fail" = "0" ] || exit 1
+          echo "All customisation guards passed."
+
+      - name: Download and verify the API package
+        if: env.SKIP != '1' && env.NEED_API == '1'
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 3 --retry-delay 10 -o /tmp/latest.zip "$API_ZIP_URL"
+          ZIP_VERSION=$(unzip -p /tmp/latest.zip version_latest.txt | tr -d '\r\n ')
+          echo "latest.zip reports $ZIP_VERSION (target $TARGET_VERSION)"
+          if [ "$ZIP_VERSION" != "$TARGET_VERSION" ]; then
+            # The release blob can lag the release tag by minutes. Retry next run
+            # rather than shipping a mismatched pair.
+            echo "::warning::latest.zip is $ZIP_VERSION, not $TARGET_VERSION - the release blob is lagging. Skipping this run."
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            echo "SKIP_REASON=latest.zip lagging at $ZIP_VERSION" >> "$GITHUB_ENV"
+          fi
+
+      - name: Record the API rollback point
+        if: env.SKIP != '1' && env.NEED_API == '1'
+        run: |
+          set -euo pipefail
+          # WEBSITE_RUN_FROM_PACKAGE=1: this file names the mounted zip, and prior
+          # zips stay in SitePackages, so restoring it is the rollback.
+          OLD_PKG=$(curl -fsS -u "$KUDU_USER:$KUDU_PASS" \
+            "https://$FUNCTION_APP.scm.azurewebsites.net/api/vfs/data/SitePackages/packagename.txt" \
+            | tr -d '\r\n ')
+          echo "Current package: $OLD_PKG"
+          echo "OLD_PACKAGE=$OLD_PKG" >> "$GITHUB_ENV"
+
+      - name: Stop here (dry run)
+        if: env.SKIP != '1' && env.DRY_RUN == '1'
+        run: |
+          set -euo pipefail
+          echo "Dry run: resolution, merge and guards all passed. Nothing published."
+          echo "SKIP=1" >> "$GITHUB_ENV"
+          echo "SKIP_REASON=dry run (would deploy $TARGET_VERSION)" >> "$GITHUB_ENV"
+
+      # --- publish: API first, frontend second ---------------------------------
+      # There is no safe direction to be mismatched in, so the aim is a short
+      # mismatch window, not a preferred order.
+
+      - name: Deploy API
+        id: deploy_api
+        if: env.SKIP != '1' && env.NEED_API == '1'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          az functionapp deployment source config-zip \
+            -g "$RG" -n "$FUNCTION_APP" --src /tmp/latest.zip --timeout 600
+          echo "API_DEPLOYED=1" >> "$GITHUB_ENV"
+          az functionapp restart -g "$RG" -n "$FUNCTION_APP"
+
+          # Kudu reports the OLD version for 30-60s after a restart while the
+          # package remounts, so poll rather than concluding failure.
+          ok=0
+          for i in $(seq 1 18); do
+            sleep 10
+            CUR=$(curl -fsS -u "$KUDU_USER:$KUDU_PASS" \
+              "https://$FUNCTION_APP.scm.azurewebsites.net/api/vfs/site/wwwroot/version_latest.txt" \
+              2>/dev/null | tr -d '\r\n ' || true)
+            echo "  poll $i: $CUR"
+            if [ "$CUR" = "$TARGET_VERSION" ]; then
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::API still not reporting $TARGET_VERSION after ~3 min"
+            exit 1
+          fi
+
+          # All five must load, or the API is up but broken.
+          WANT=$(echo "$EXPECTED_FUNCTIONS" | tr ' ' '\n' | sort | tr '\n' ' ' | sed 's/ *$//')
+          ok=0
+          for i in $(seq 1 6); do
+            GOT=$(az functionapp function list -g "$RG" -n "$FUNCTION_APP" \
+              --query "[].name" -o tsv | sed 's|.*/||' | sort | tr '\n' ' ' | sed 's/ *$//')
+            echo "  functions: $GOT"
+            if [ "$GOT" = "$WANT" ]; then
+              ok=1
+              break
+            fi
+            sleep 15
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Expected functions [$WANT] did not all load"
+            exit 1
+          fi
+          echo "API $TARGET_VERSION deployed and verified."
+
+      - name: Mark API failure
+        if: steps.deploy_api.outcome == 'failure'
+        run: |
+          echo "FAILED=1" >> "$GITHUB_ENV"
+          echo "FAIL_REASON=API deploy/verify failed" >> "$GITHUB_ENV"
+
+      - name: Push the frontend merge commit
+        id: push_frontend
+        if: env.SKIP != '1' && env.FAILED != '1' && env.NEED_FE == '1' && env.MERGE_SHA != ''
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Pushing with GITHUB_TOKEN does not trigger the Azure-generated SWA
+          # workflow, which is why the deploy below is inline.
+          git push origin HEAD:main
+          echo "FRONTEND_PUSHED=1" >> "$GITHUB_ENV"
+
+      - name: Mark push failure
+        if: steps.push_frontend.outcome == 'failure'
+        run: |
+          echo "FAILED=1" >> "$GITHUB_ENV"
+          echo "FAIL_REASON=pushing the merge commit failed" >> "$GITHUB_ENV"
+
+      - name: Deploy frontend
+        id: deploy_frontend
+        if: env.SKIP != '1' && env.FAILED != '1' && env.NEED_FE == '1'
+        continue-on-error: true
+        # Must mirror azure-static-web-apps-icy-coast-0a0b54603.yml. If Azure
+        # regenerates that workflow, re-check these values against it.
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ICY_COAST_0A0B54603 }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          app_location: "/"
+          api_location: ""
+          output_location: "/out"
+
+      - name: Mark frontend deploy failure
+        if: steps.deploy_frontend.outcome == 'failure'
+        run: |
+          echo "FAILED=1" >> "$GITHUB_ENV"
+          echo "FAIL_REASON=frontend build/deploy failed" >> "$GITHUB_ENV"
+
+      - name: Verify login is still tenant-locked
+        id: verify_login
+        if: env.SKIP != '1' && env.FAILED != '1'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # The unattended substitute for eyeballing the portal: catches a clobbered
+          # auth config, the failure that would lock the whole team out.
+          ok=0
+          for i in $(seq 1 6); do
+            rm -f /tmp/jar
+            URL=$(curl -sS -c /tmp/jar -b /tmp/jar -L --max-time 45 \
+              -o /dev/null -w '%{url_effective}' "https://$SWA_HOSTNAME/login" || true)
+            echo "  attempt $i: $URL"
+            if echo "$URL" | grep -q "login.microsoftonline.com/$LOGIN_TENANT_ID/oauth2/v2.0/authorize" \
+              && echo "$URL" | grep -q "client_id=$LOGIN_CLIENT_ID"; then
+              ok=1
+              break
+            fi
+            sleep 20
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Login no longer redirects to the Shoothill-locked Entra app"
+            exit 1
+          fi
+
+          # Confirms the new bundle is actually being served: /version.json sits
+          # behind SWA auth, but the branding assets do not.
+          for f in shoothill-logo-light.svg shoothill-logo-dark.svg; do
+            CODE=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "https://$SWA_HOSTNAME/assets/$f")
+            echo "  /assets/$f -> $CODE"
+            if [ "$CODE" != "200" ]; then
+              echo "::error::branding asset $f is not being served (HTTP $CODE)"
+              exit 1
+            fi
+          done
+          echo "Login lock and branding verified."
+
+      - name: Mark verification failure
+        if: steps.verify_login.outcome == 'failure'
+        run: |
+          echo "FAILED=1" >> "$GITHUB_ENV"
+          echo "FAIL_REASON=post-deploy verification failed" >> "$GITHUB_ENV"
+
+      # --- rollback ------------------------------------------------------------
+
+      - name: Roll back the frontend
+        if: env.FAILED == '1' && env.FRONTEND_PUSHED == '1'
+        run: |
+          set -euo pipefail
+          git config user.name "cipp-update-bot"
+          git config user.email "cipp-update-bot@users.noreply.github.com"
+          git revert --no-edit -m 1 "$MERGE_SHA"
+          git push origin HEAD:main
+          echo "Reverted $MERGE_SHA on main; redeploying the previous frontend."
+
+      - name: Redeploy the previous frontend
+        id: rollback_frontend_deploy
+        if: env.FAILED == '1' && env.FRONTEND_PUSHED == '1'
+        continue-on-error: true
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_ICY_COAST_0A0B54603 }}
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          action: "upload"
+          app_location: "/"
+          api_location: ""
+          output_location: "/out"
+
+      - name: Roll back the API
+        if: env.FAILED == '1' && env.API_DEPLOYED == '1'
+        run: |
+          set -euo pipefail
+          echo "Restoring package $OLD_PACKAGE"
+          curl -fsS -u "$KUDU_USER:$KUDU_PASS" -X PUT -H "If-Match: *" \
+            --data-binary "$OLD_PACKAGE" \
+            "https://$FUNCTION_APP.scm.azurewebsites.net/api/vfs/data/SitePackages/packagename.txt"
+          az functionapp restart -g "$RG" -n "$FUNCTION_APP"
+          ok=0
+          for i in $(seq 1 18); do
+            sleep 10
+            CUR=$(curl -fsS -u "$KUDU_USER:$KUDU_PASS" \
+              "https://$FUNCTION_APP.scm.azurewebsites.net/api/vfs/site/wwwroot/version_latest.txt" \
+              2>/dev/null | tr -d '\r\n ' || true)
+            echo "  poll $i: $CUR"
+            if [ "$CUR" = "$API_VERSION_BEFORE" ]; then
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::API ROLLBACK FAILED - the API is not back on $API_VERSION_BEFORE. Manual intervention needed."
+            exit 1
+          fi
+          echo "API restored to $API_VERSION_BEFORE."
+
+      # --- report --------------------------------------------------------------
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### CIPP self-hosted update"
+            echo
+            if [ "${FAILED:-0}" = "1" ]; then
+              echo "**Result:** FAILED - ${FAIL_REASON:-unknown} (rolled back)"
+            elif [ "${SKIP:-0}" = "1" ]; then
+              echo "**Result:** no-op - ${SKIP_REASON:-nothing to do}"
+            else
+              echo "**Result:** updated to ${TARGET_VERSION:-?}"
+            fi
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Target version | ${TARGET_VERSION:-not resolved} |"
+            echo "| API before | ${API_VERSION_BEFORE:-?} |"
+            echo "| Frontend before | ${FE_VERSION_BEFORE:-?} |"
+            echo "| Frontend commit | ${FRONTEND_SHA:-n/a} |"
+            echo "| Mode | dry_run=${DRY_RUN:-?} force=${FORCE:-?} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run
+        if: env.FAILED == '1'
+        run: |
+          echo "::error::${FAIL_REASON:-run failed} - changes were rolled back"
+          exit 1
