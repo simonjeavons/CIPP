@@ -217,10 +217,20 @@ jobs:
           set -euo pipefail
           git config user.name "cipp-update-bot"
           git config user.email "cipp-update-bot@users.noreply.github.com"
+          PRE_MERGE=$(git rev-parse HEAD)
           # Merge an exact commit, never a branch, so what gets deployed is pinned.
           if git merge --no-ff --no-edit "$FRONTEND_SHA" \
                -m "Auto-update: merge upstream CIPP $TARGET_VERSION ($FRONTEND_SHA)"; then
-            echo "MERGE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+            MERGE_SHA=$(git rev-parse HEAD)
+            echo "MERGE_SHA=$MERGE_SHA" >> "$GITHUB_ENV"
+            # A forced redeploy of the current version merges nothing, so there is no
+            # new commit and nothing for the rollback to revert.
+            if [ "$MERGE_SHA" = "$PRE_MERGE" ]; then
+              echo "MERGE_CREATED=0" >> "$GITHUB_ENV"
+              echo "Already up to date - no new commit created."
+            else
+              echo "MERGE_CREATED=1" >> "$GITHUB_ENV"
+            fi
           else
             CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
             git merge --abort || true
@@ -366,7 +376,13 @@ jobs:
           # Pushing with GITHUB_TOKEN does not trigger the Azure-generated SWA
           # workflow, which is why the deploy below is inline.
           git push origin HEAD:main
-          echo "FRONTEND_PUSHED=1" >> "$GITHUB_ENV"
+          # Only claim a rollback point when a commit was actually added, or the
+          # rollback would try to revert an unrelated commit.
+          if [ "${MERGE_CREATED:-0}" = "1" ]; then
+            echo "FRONTEND_PUSHED=1" >> "$GITHUB_ENV"
+          else
+            echo "Nothing new pushed; no frontend rollback point needed."
+          fi
 
       - name: Mark push failure
         if: steps.push_frontend.outcome == 'failure'
@@ -441,13 +457,23 @@ jobs:
 
       # --- rollback ------------------------------------------------------------
 
+      # continue-on-error throughout the rollback: a frontend rollback that fails must
+      # not stop the API from being rolled back too.
+
       - name: Roll back the frontend
+        id: rollback_frontend_revert
         if: env.FAILED == '1' && env.FRONTEND_PUSHED == '1'
+        continue-on-error: true
         run: |
           set -euo pipefail
           git config user.name "cipp-update-bot"
           git config user.email "cipp-update-bot@users.noreply.github.com"
-          git revert --no-edit -m 1 "$MERGE_SHA"
+          # -m 1 picks the first parent, and only applies to a merge commit.
+          if [ "$(git rev-list --parents -n 1 "$MERGE_SHA" | wc -w)" -ge 3 ]; then
+            git revert --no-edit -m 1 "$MERGE_SHA"
+          else
+            git revert --no-edit "$MERGE_SHA"
+          fi
           git push origin HEAD:main
           echo "Reverted $MERGE_SHA on main; redeploying the previous frontend."
 
@@ -464,8 +490,14 @@ jobs:
           api_location: ""
           output_location: "/out"
 
+      - name: Check the frontend rollback landed
+        if: env.FAILED == '1' && env.FRONTEND_PUSHED == '1' && (steps.rollback_frontend_revert.outcome == 'failure' || steps.rollback_frontend_deploy.outcome == 'failure')
+        run: |
+          echo "::error::FRONTEND ROLLBACK FAILED - main may still carry the bad merge and the live site may still serve it. Manual intervention needed."
+
       - name: Roll back the API
         if: env.FAILED == '1' && env.API_DEPLOYED == '1'
+        continue-on-error: true
         run: |
           set -euo pipefail
           echo "Restoring package $OLD_PACKAGE"
