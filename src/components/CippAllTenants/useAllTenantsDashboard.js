@@ -1,5 +1,6 @@
 import { useMemo } from 'react'
 import { ApiGetCall } from '../../api/ApiCall.jsx'
+import { usePermissions } from '../../hooks/use-permissions'
 
 // Some CIPP endpoints return a bare array, others wrap in { Results: [...] }. Normalise both.
 export const asArray = (payload) => {
@@ -74,16 +75,18 @@ export const deriveSecureScoreSummary = (rows, displayNameByDomain = new Map()) 
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([date, value]) => ({
       date,
-      percent: value.count ? Math.round((value.total / value.count) * 10) / 10 : 0,
+      percent: value.count ? Math.round((value.total / value.count) * 100) / 100 : 0,
     }))
 
   const delta =
     trend.length > 1
-      ? Math.round((trend[trend.length - 1].percent - trend[0].percent) * 10) / 10
+      ? Math.round((trend[trend.length - 1].percent - trend[0].percent) * 100) / 100
       : null
 
   return {
-    average: Math.round(withNames.reduce((sum, row) => sum + row.percent, 0) / withNames.length),
+    average:
+      Math.round((withNames.reduce((sum, row) => sum + row.percent, 0) / withNames.length) * 100) /
+      100,
     worst: sorted[0],
     best: sorted[sorted.length - 1],
     scored: withNames.length,
@@ -117,9 +120,12 @@ const ADHOC_CACHE_TYPES = new Set([
   'OneDriveRootPermissions',
 ])
 
+// Collections that are no longer cached. Their old rows stay in the table and never refresh.
+const RETIRED_CACHE_TYPES = new Set(['CredentialUserRegistrationDetails', 'DeviceSettings'])
+
 // The nightly orchestrator runs at 03:00, so a tenant that collected yesterday is still healthy;
-// past 30 hours it has missed a run, and past 72 it has missed three.
-const STALE_HOURS = 30
+// past 48 hours it has missed two runs, and past 72 it has missed three.
+const STALE_HOURS = 48
 const CRITICAL_HOURS = 72
 
 /**
@@ -140,6 +146,7 @@ export const deriveCacheSummary = (rows, tenants) => {
 
   rows.forEach((row) => {
     const type = row?.Type
+    if (RETIRED_CACHE_TYPES.has(type)) return
     const count = Number(row?.Count ?? 0)
     // Scale totals still count every collection — only the age judgement is scoped.
     if (type) totals.set(type, (totals.get(type) ?? 0) + count)
@@ -256,6 +263,13 @@ export const useAllTenantsDashboard = () => {
     waiting: true,
   })
 
+  // Same key and TTL as the layout's call so react-query serves one shared copy.
+  const featureFlagsApi = ApiGetCall({
+    url: '/api/ListFeatureFlags',
+    queryKey: 'featureFlags',
+    staleTime: 600000,
+  })
+
   // countsOnly returns the aggregates with no rows. Deriving them here pulled the estate's whole
   // failed-test set over the wire, growing linearly with tenant count.
   const failedTestsApi = ApiGetCall({
@@ -281,12 +295,17 @@ export const useAllTenantsDashboard = () => {
     waiting: true,
   })
 
-  // ListLogs defaults to today's partition when no date is supplied, which keeps this cheap.
+  // ListLogs sits behind CIPP.Logs rather than the sign-in permission; a role without it skips the
+  // call so the dashboard does not surface a 403 for a page the role is allowed to open.
+  const { checkPermissions } = usePermissions()
+  const canReadLogs = checkPermissions(['CIPP.Logs.*'])
+
+  // ListLogs defaults to today's partition when no date is supplied; the first page is enough here.
   const logsApi = ApiGetCall({
     url: '/api/ListLogs',
     data: { Filter: 'True', Severity: 'Error,Critical' },
     queryKey: 'AllTenantsDashboard-Logs',
-    waiting: true,
+    waiting: canReadLogs,
   })
 
   // Score fields only — the endpoint projects away controlScores, which is ~15 KB per cached record.
@@ -378,8 +397,14 @@ export const useAllTenantsDashboard = () => {
       })),
       pendingDeviations: summary.PendingDeviations ?? 0,
       pendingTenantCount: summary.PendingTenantCount ?? 0,
+      // The Baselines flag hides the classic standards pages and the summary then scores baselines.
+      path: asArray(featureFlagsApi.data).some(
+        (flag) => flag.Id === 'Baselines' && flag.Enabled === true
+      )
+        ? '/tenant/baselines/alignment'
+        : '/tenant/standards/alignment',
     }
-  }, [alignmentApi.data])
+  }, [alignmentApi.data, featureFlagsApi.data])
 
   /* ------------------------------------------------------------- test results */
 
@@ -452,7 +477,7 @@ export const useAllTenantsDashboard = () => {
   /* -------------------------------------------------------------------- logs */
 
   const logs = useMemo(() => {
-    const rows = asArray(logsApi.data).filter((row) =>
+    const rows = asArray(logsApi.data?.Results).filter((row) =>
       ['error', 'critical'].includes(String(row?.Severity ?? '').toLowerCase())
     )
 
@@ -535,6 +560,7 @@ export const useAllTenantsDashboard = () => {
   return {
     tenantCount,
     tenants: tenantsApi,
+    canReadLogs,
     alignmentApi,
     failedTestsApi,
     domainsApi,
